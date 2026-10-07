@@ -31,24 +31,7 @@ For example, a farmer eligible for five schemes might be receiving one, have a b
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    U["User"] --> PA["Profile Agent"]
-
-    subgraph BIA["Benefit Intelligence Agent"]
-        direction LR
-        B1["Entitlement discovery"] --> B2["Benefit audit"] --> B3["Root cause analysis"] --> B4["Action planning"]
-        B5["Follow-up and monitoring"] -.->|re-plan| B2
-    end
-
-    PA --> B1
-    B4 --> HA{"Human approval"}
-    HA -->|approved| AA["Action Agent"]
-    AA -.->|feedback| B4
-    AA --> VA["Verification Agent"]
-    VA -->|received| DONE["Benefit resolved"]
-    VA -->|not received| B5
-```
+![AdhikarAI architecture](assets/architecture.png)
 
 The system is a stateful multi-agent workflow. Each agent has one responsibility, and the workflow can loop back when an action fails or a case is still unresolved.
 
