@@ -32,49 +32,22 @@ For example, a farmer eligible for five schemes might be receiving one, have a b
 ## Architecture
 
 ```mermaid
-flowchart LR
-    subgraph IN[User]
-        direction TB
-        I1[Chat / voice]
-        I2[Document upload]
-        I3[Existing application IDs]
-        I4[Preferences: state, occupation, income]
-    end
+flowchart TD
+    U["User"] --> PA["Profile Agent"]
 
-    subgraph PA[Profile Agent]
-        direction TB
-        P1[Extract info: LLM + OCR] --> P2[Build structured profile] --> P3[Validate and enrich]
-    end
-
-    subgraph BIA[Benefit Intelligence Agent]
+    subgraph BIA["Benefit Intelligence Agent"]
         direction LR
-        B1[1. Entitlement discovery] --> B2[2. Benefit audit] --> B3[3. Root cause analysis] --> B4[4. Action planning]
-        B5[5. Follow-up and monitoring]
-        B5 -.-> B1
-        B5 -.-> B2
-        B5 -.-> B4
+        B1["Entitlement discovery"] --> B2["Benefit audit"] --> B3["Root cause analysis"] --> B4["Action planning"]
+        B5["Follow-up and monitoring"] -.->|re-plan| B2
     end
 
-    HA{Human approval}
-
-    subgraph AA[Action Agent]
-        direction TB
-        A1[Portal / API interactions]
-        A2[Form filling]
-        A3[Document submission]
-        A4[Submit / escalate]
-    end
-
-    VA[Verification Agent: check status, approval and payment]
-    DONE[Benefit resolved: update dashboard, notify user]
-
-    IN --> PA --> BIA
-    B4 --> HA --> AA
-    BIA -. needs user input .-> HA
-    AA -. feedback / corrections .-> BIA
-    AA --> VA
-    VA -->|received| DONE
-    VA -->|not received| BIA
+    PA --> B1
+    B4 --> HA{"Human approval"}
+    HA -->|approved| AA["Action Agent"]
+    AA -.->|feedback| B4
+    AA --> VA["Verification Agent"]
+    VA -->|received| DONE["Benefit resolved"]
+    VA -->|not received| B5
 ```
 
 The system is a stateful multi-agent workflow. Each agent has one responsibility, and the workflow can loop back when an action fails or a case is still unresolved.
