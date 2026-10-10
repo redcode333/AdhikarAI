@@ -1,0 +1,673 @@
+/**
+ * The Benefit Audit.
+ *
+ * Answers "what actually happened?" by comparing the expected entitlement
+ * against the government's record, the citizen's account and whatever evidence
+ * exists. Composed of the five audits the specification calls for - status,
+ * approval, payment, receipt and continuity - feeding one gap list and one
+ * decision.
+ *
+ * All the reasoning is the deterministic engine's. This service's job is to
+ * GATHER the four kinds of fact, hand them to the engine, and persist what
+ * comes back. No model call happens anywhere in this path, which is why an
+ * audit is reproducible and why its conclusion can be defended line by line.
+ *
+ * The audit is also the one place that must resist a tempting simplification:
+ * reading `gov_disbursement.status = RELEASED` and recording the money as
+ * received. It is released. Whether it arrived is a separate question with a
+ * separate answer, and frequently a different one.
+ */
+
+import { prisma } from "@/lib/db";
+import type { Clock } from "@/lib/clock";
+import { govGateway } from "@/lib/adapters/mockGovGateway";
+import { add, paise, ZERO, type Paise } from "@/lib/engine/money";
+import { auditContinuity, type ActualPaymentRecord } from "@/lib/engine/continuity";
+import { detectGaps, type DetectedGap } from "@/lib/engine/gaps";
+import { reconcile, type ReconcileResult } from "@/lib/engine/reconciler";
+import { projectLedger } from "@/lib/engine/ledger";
+import {
+  CONSENT_AND_ACTION_STATES,
+  EXCEPTION_STATES,
+  RECOVERY_IN_PROGRESS_STATES,
+  pathTo,
+  stateForReceipt,
+} from "@/lib/engine/stateMachine";
+import { generateSchedule, periodLabel } from "@/lib/engine/period";
+import { log } from "@/lib/log";
+import { expectedForPayment } from "./expected";
+import type {
+  AuditDecision,
+  ApplicationStatus,
+  GovApplicationStatus,
+} from "@/lib/generated/prisma/enums";
+import type { Prisma } from "@/lib/generated/prisma/client";
+import { transitionEntitlement, type Actor } from "./transitions";
+
+const asJson = (value: unknown): Prisma.InputJsonValue =>
+  value as Prisma.InputJsonValue;
+
+const MS_PER_DAY = 86_400_000;
+
+/** Map a portal status onto our application status vocabulary. */
+function mapGovStatus(status: GovApplicationStatus): ApplicationStatus {
+  switch (status) {
+    case "RECEIVED":
+      return "SUBMITTED";
+    case "UNDER_REVIEW":
+      return "PENDING";
+    case "PENDING_DOCUMENT":
+      return "RETURNED";
+    case "APPROVED":
+      return "APPROVED";
+    case "REJECTED":
+      return "REJECTED";
+    case "RETURNED":
+      return "RETURNED";
+  }
+}
+
+export interface AuditResult {
+  auditId: string;
+  entitlementId: string;
+  schemeCode: string;
+  decision: AuditDecision;
+  summary: string;
+  gaps: DetectedGap[];
+  /** Proven absent, with evidence. */
+  provenMissingAmount: Paise;
+  /** Released but unconfirmed. Reported separately, always. */
+  unverifiedAmount: Paise;
+  receivedAmount: Paise;
+  findings: Array<{ area: string; summary: string; evidence: unknown }>;
+  /** True when the government data came from the simulation. */
+  isMockData: boolean;
+}
+
+/**
+ * Run a full audit for one entitlement.
+ *
+ * Reads the government side only through the gateway, never by querying
+ * `gov_*` directly, which is what keeps the two stores genuinely separate.
+ */
+export async function auditBenefit(input: {
+  citizenId: string;
+  entitlementId: string;
+  clock: Clock;
+  actor?: Actor;
+  triggeredByEventId?: string;
+  /**
+   * Whether this audit may move the lifecycle state. Defaults to true.
+   *
+   * Re-verification passes false: it has already moved the benefit to
+   * REVERIFYING and will decide between RECOVERED and RE_AUDIT_REQUIRED
+   * itself. Without this the audit would try to set GAP_DETECTED from
+   * REVERIFYING, which is illegal, and log an error on an entirely normal
+   * path.
+   */
+  manageLifecycle?: boolean;
+}): Promise<AuditResult> {
+  const actor: Actor = input.actor ?? { kind: "agent", name: "audit" };
+  const now = input.clock.now();
+
+  const entitlement = await prisma.entitlement.findFirstOrThrow({
+    where: { id: input.entitlementId, citizenId: input.citizenId },
+    include: {
+      scheme: true,
+      application: { include: { documents: true } },
+      expectedPayments: true,
+      payments: {
+        include: {
+          // Newest verification first. The id is a deterministic tiebreak:
+          // two verifications can share a timestamp (a citizen answering and
+          // uploading evidence in the same second, or a simulated clock), and
+          // "whichever row the database happened to return" must not decide
+          // whether money is recorded as missing.
+          verifications: { orderBy: [{ verifiedAt: "desc" }, { id: "desc" }] },
+        },
+      },
+    },
+  });
+
+  const gateway = govGateway();
+  const findings: AuditResult["findings"] = [];
+
+  // -------------------------------------------------------------------------
+  // 1 & 2. Application and approval status
+  // -------------------------------------------------------------------------
+  const applicationRef = entitlement.application?.govApplicationRef ?? null;
+
+  // Look the government side up by OUR application reference only.
+  //
+  // This previously fell back to searching by scheme and the last four digits
+  // of Aadhaar. Four digits identify one person in ten thousand, so in any real
+  // caseload that fallback would attach another citizen's application - and
+  // their disbursements - to this benefit. A benefit we never lodged has no
+  // government record we can soundly claim.
+  const govStatus = applicationRef
+    ? await gateway.getApplicationStatus(applicationRef)
+    : null;
+
+  let applicationStatus: ApplicationStatus | null =
+    entitlement.application?.status ?? null;
+  let rejectionReason: string | null =
+    entitlement.application?.rejectionReason ?? null;
+  let daysSinceSubmission: number | null = null;
+
+  if (govStatus) {
+    applicationStatus = mapGovStatus(govStatus.status);
+    rejectionReason = govStatus.rejectionReason;
+    daysSinceSubmission =
+      (now.getTime() - govStatus.receivedOn.getTime()) / MS_PER_DAY;
+
+    findings.push({
+      area: "APPLICATION_STATUS",
+      summary: `The ${gateway.isMock ? "simulated " : ""}portal reports this application as ${govStatus.status}, received ${Math.round(daysSinceSubmission)} days ago.`,
+      evidence: {
+        applicationRef: govStatus.applicationRef,
+        status: govStatus.status,
+        receivedOn: govStatus.receivedOn.toISOString(),
+        events: govStatus.events.map((e) => ({
+          status: e.status,
+          note: e.note,
+          occurredOn: e.occurredOn.toISOString(),
+        })),
+        isMockData: gateway.isMock,
+      },
+    });
+
+    if (govStatus.status === "APPROVED") {
+      findings.push({
+        area: "APPROVAL_STATUS",
+        summary: `Approved on ${govStatus.decidedOn?.toISOString().slice(0, 10) ?? "an unrecorded date"}.`,
+        evidence: { decidedOn: govStatus.decidedOn?.toISOString() ?? null },
+      });
+    } else if (govStatus.status === "REJECTED") {
+      findings.push({
+        area: "APPROVAL_STATUS",
+        summary: govStatus.rejectionReason
+          ? `Rejected: ${govStatus.rejectionReason}`
+          : "Rejected, with no reason recorded.",
+        evidence: { rejectionReason: govStatus.rejectionReason },
+      });
+    }
+
+    // Keep our copy in step with the portal.
+    if (entitlement.application) {
+      await prisma.application.update({
+        where: { id: entitlement.application.id },
+        data: {
+          status: applicationStatus,
+          rejectionReason,
+          decidedAt: govStatus.decidedOn,
+        },
+      });
+    }
+  } else if (entitlement.application) {
+    findings.push({
+      area: "APPLICATION_STATUS",
+      summary:
+        "No record of this application could be found at the portal, so its current status is unknown.",
+      evidence: { applicationRef, isMockData: gateway.isMock },
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // 3 & 4. Payment and receipt
+  // -------------------------------------------------------------------------
+  // Same rule: disbursements are only ever read against our own reference.
+  const disbursements = applicationRef
+    ? await gateway.listDisbursements({ applicationRef })
+    : [];
+
+  const expectedPerInstalment =
+    entitlement.expectedAmountPaise === null
+      ? null
+      : paise(entitlement.expectedAmountPaise);
+
+  const reconciliations: ReconcileResult[] = [];
+  const periodReconciliations: Array<{
+    periodLabel: string;
+    result: ReconcileResult;
+  }> = [];
+  const actualPayments: ActualPaymentRecord[] = [];
+
+  for (const disbursement of disbursements) {
+    // Our own record of this period, carrying the citizen's answer and any
+    // evidence already gathered.
+    const existing = entitlement.payments.find(
+      (p) => p.periodLabel === disbursement.periodLabel,
+    );
+    const latestVerification = existing?.verifications[0] ?? null;
+
+    const reconciliation = reconcile({
+      // A staged benefit is reconciled stage by stage. Comparing one stage
+      // against the full entitlement reported the not-yet-due remainder as
+      // proven missing money.
+      expectedAmount: expectedForPayment({
+        schemeCode: entitlement.scheme.code,
+        entitlementExpected: entitlement.expectedAmountPaise,
+        reportedAmount: disbursement.amountPaise,
+        released: disbursement.status === "RELEASED",
+      }),
+      // A FAILED or RETURNED disbursement never left, so it is not reported
+      // as released.
+      governmentReportedAmount:
+        disbursement.status === "RELEASED"
+          ? paise(disbursement.amountPaise)
+          : null,
+      citizenReport: latestVerification?.citizenReport ?? null,
+      evidence: latestVerification
+        ? {
+            result: latestVerification.evidenceResult,
+            matchedAmount:
+              latestVerification.matchedAmountPaise === null
+                ? null
+                : paise(latestVerification.matchedAmountPaise),
+          }
+        : null,
+    });
+
+    reconciliations.push(reconciliation);
+    periodReconciliations.push({
+      periodLabel: disbursement.periodLabel,
+      result: reconciliation,
+    });
+
+    // Explicit create-or-update rather than an upsert: (entitlement, period)
+    // has no unique constraint, because a scheme can legitimately release more
+    // than one disbursement for the same period (an arrears payment alongside
+    // the regular one), and a unique index would reject the second.
+    if (existing) {
+      await prisma.payment.update({
+        where: { id: existing.id },
+        data: {
+          govDisbursementRef: disbursement.disbursementRef,
+          reportedAmountPaise: disbursement.amountPaise,
+          reportedOn: disbursement.releasedOn,
+          receiptState: reconciliation.receiptState,
+          gapAmountPaise: reconciliation.gapAmount,
+        },
+      });
+    } else {
+      await prisma.payment.create({
+        data: {
+          entitlementId: entitlement.id,
+          periodLabel: disbursement.periodLabel,
+          govDisbursementRef: disbursement.disbursementRef,
+          reportedAmountPaise: disbursement.amountPaise,
+          reportedOn: disbursement.releasedOn,
+          receiptState: reconciliation.receiptState,
+          gapAmountPaise: reconciliation.gapAmount,
+        },
+      });
+    }
+
+    // Only a RELEASED disbursement satisfies a period for continuity. A FAILED
+    // or RETURNED one never left the treasury; counting it as paid made the
+    // month look covered while nothing was sent and nothing was reconciled.
+    if (disbursement.status === "RELEASED") {
+      actualPayments.push({
+        periodLabel: disbursement.periodLabel,
+        receiptState: reconciliation.receiptState,
+        reportedAmount: paise(disbursement.amountPaise),
+        reportedOn: disbursement.releasedOn,
+      });
+    }
+
+    findings.push({
+      area: "PAYMENT",
+      summary:
+        disbursement.status === "RELEASED"
+          ? `The ${gateway.isMock ? "simulated " : ""}government record shows a release for ${disbursement.periodLabel}.`
+          : `The disbursement for ${disbursement.periodLabel} is recorded as ${disbursement.status}${disbursement.failureReason ? `: ${disbursement.failureReason}` : ""}.`,
+      evidence: {
+        disbursementRef: disbursement.disbursementRef,
+        periodLabel: disbursement.periodLabel,
+        amountPaise: disbursement.amountPaise.toString(),
+        releasedOn: disbursement.releasedOn.toISOString(),
+        status: disbursement.status,
+        failureReason: disbursement.failureReason,
+        channel: disbursement.channel,
+        isMockData: gateway.isMock,
+      },
+    });
+
+    findings.push({
+      area: "RECEIPT",
+      summary: reconciliation.reasons.join(" "),
+      evidence: {
+        periodLabel: disbursement.periodLabel,
+        receiptState: reconciliation.receiptState,
+        method: reconciliation.method,
+        hasConflict: reconciliation.hasConflict,
+      },
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // 5. Continuity
+  // -------------------------------------------------------------------------
+  let expectedSchedule = entitlement.expectedPayments.map((p) => ({
+    periodLabel: p.periodLabel,
+    dueOn: p.dueOn,
+    expectedAmount: paise(p.expectedAmountPaise),
+  }));
+
+  // Materialise the expected schedule, and EXTEND it as time passes.
+  //
+  // It is created only once a benefit is actually approved - doing it at
+  // discovery would invent due dates for money never owed. But it must also
+  // grow: a schedule generated in January reached only to January, so by April
+  // the February and March instalments would not exist to be missed, and a
+  // pension that stopped would look perfectly healthy. Topping up on every
+  // audit is what makes the continuity check work over time rather than only
+  // at the moment of approval.
+  if (
+    applicationStatus === "APPROVED" &&
+    expectedPerInstalment !== null &&
+    govStatus?.decidedOn
+  ) {
+    const generated = generateSchedule({
+      frequency: entitlement.frequency,
+      startDate: govStatus.decidedOn,
+      until: now,
+      amount: expectedPerInstalment,
+    });
+
+    const known = new Set(expectedSchedule.map((p) => p.periodLabel));
+    const added = generated.filter((item) => !known.has(item.periodLabel));
+
+    if (added.length > 0) {
+      await prisma.expectedPayment.createMany({
+        data: added.map((item) => ({
+          entitlementId: entitlement.id,
+          periodLabel: item.periodLabel,
+          dueOn: item.dueOn,
+          expectedAmountPaise: item.expectedAmount,
+        })),
+        skipDuplicates: true,
+      });
+      expectedSchedule = [...expectedSchedule, ...added];
+    }
+  }
+
+  const continuity = auditContinuity({
+    expected: expectedSchedule,
+    actual: actualPayments,
+    now,
+  });
+
+  if (expectedSchedule.length > 0) {
+    findings.push({
+      area: "CONTINUITY",
+      summary:
+        continuity.gaps.length === 0
+          ? `All ${expectedSchedule.length} expected payment period(s) are accounted for.`
+          : `${continuity.missedPeriods.length} expected payment period(s) have no disbursement: ${continuity.missedPeriods.join(", ")}.`,
+      evidence: {
+        expectedPeriods: expectedSchedule.map((p) => p.periodLabel),
+        paidPeriods: continuity.paidPeriods,
+        missedPeriods: continuity.missedPeriods,
+        pendingPeriods: continuity.pendingPeriods,
+        isInterrupted: continuity.isInterrupted,
+      },
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Gap detection and decision
+  // -------------------------------------------------------------------------
+  const missingDocuments = (entitlement.application?.documents ?? [])
+    .filter((d) => !d.provided)
+    .map((d) => d.kind as string);
+
+  const detection = detectGaps({
+    verdict: entitlement.verdict,
+    applicationStatus,
+    daysSinceSubmission,
+    rejectionReason,
+    missingDocuments,
+    // Every period, not only the latest: a new month's unconfirmed payment
+    // must not hide last month's proven discrepancy.
+    periodReconciliations,
+    continuityGaps: continuity.gaps,
+  });
+
+  // Totals across every period, not only the latest.
+  let unverifiedAmount = ZERO;
+  let receivedAmount = ZERO;
+  for (const reconciliation of reconciliations) {
+    unverifiedAmount = add(unverifiedAmount, reconciliation.unverifiedAmount);
+    receivedAmount = add(receivedAmount, reconciliation.receivedAmount);
+  }
+  // detectGaps already folds the continuity misses into this total, so adding
+  // continuity.totalMissingAmount again here would double-count them.
+  const provenMissingAmount = detection.totalProvenMissing;
+
+  // -------------------------------------------------------------------------
+  // Persist
+  // -------------------------------------------------------------------------
+  const audit = await prisma.benefitAudit.create({
+    data: {
+      entitlementId: entitlement.id,
+      decision: detection.decision,
+      summary: detection.summary,
+      runAt: now,
+      triggeredByEventId: input.triggeredByEventId,
+      findings: {
+        create: findings.map((finding) => ({
+          area: finding.area as never,
+          summary: finding.summary,
+          evidence: asJson(finding.evidence),
+        })),
+      },
+    },
+  });
+
+  // Reconcile gaps by identity (kind + period) rather than deleting and
+  // recreating them.
+  //
+  // This was previously a deleteMany followed by inserts, which was a real
+  // bug: RootCause and ActionPlan cascade from BenefitGap, so every re-audit
+  // destroyed the record of what had already been diagnosed and tried. The
+  // recovery loop depends on that history to avoid repeating a failed action,
+  // and a system built for auditability must not erase its own trail.
+  //
+  // A gap that is no longer detected is marked RESOLVED with a timestamp, not
+  // deleted: "this was wrong and is now fixed" is information worth keeping.
+  const openGaps = await prisma.benefitGap.findMany({
+    where: { entitlementId: entitlement.id, resolvedAt: null },
+  });
+
+  const identityOf = (kind: string, period: string | null): string =>
+    `${kind}::${period ?? ""}`;
+
+  const detectedIdentities = new Set(
+    detection.gaps.map((gap) => identityOf(gap.kind, gap.periodLabel)),
+  );
+
+  for (const gap of detection.gaps) {
+    const identity = identityOf(gap.kind, gap.periodLabel);
+    const existing = openGaps.find(
+      (row) => identityOf(row.kind, row.periodLabel) === identity,
+    );
+
+    if (existing) {
+      await prisma.benefitGap.update({
+        where: { id: existing.id },
+        data: {
+          auditId: audit.id,
+          amountPaise: gap.amount,
+          evidence: asJson(gap.evidence),
+        },
+      });
+    } else {
+      await prisma.benefitGap.create({
+        data: {
+          entitlementId: entitlement.id,
+          auditId: audit.id,
+          kind: gap.kind,
+          periodLabel: gap.periodLabel,
+          amountPaise: gap.amount,
+          evidence: asJson(gap.evidence),
+          detectedAt: now,
+        },
+      });
+    }
+  }
+
+  // Anything still open that this audit did not find has been resolved.
+  const resolvedIds = openGaps
+    .filter((row) => !detectedIdentities.has(identityOf(row.kind, row.periodLabel)))
+    .map((row) => row.id);
+
+  if (resolvedIds.length > 0) {
+    await prisma.benefitGap.updateMany({
+      where: { id: { in: resolvedIds } },
+      data: { resolvedAt: now },
+    });
+  }
+
+  // Carry forward what has already been recovered. Without this every audit
+  // recomputed recovery status from zero, so the first monitoring pass after a
+  // recovery reset RESOLVED back to NOT_APPLICABLE and the dashboard's
+  // "recovered" count quietly dropped the case.
+  const previousLedger = await prisma.benefitLedger.findUnique({
+    where: { entitlementId: entitlement.id },
+    select: { recoveredAmountPaise: true },
+  });
+
+  const ledger = projectLedger({
+    expectedAmount: expectedPerInstalment,
+    applicationStatus,
+    payments: reconciliations,
+    recoveredAmount: paise(previousLedger?.recoveredAmountPaise ?? 0n),
+    appliedAt: entitlement.application?.submittedAt ?? null,
+    lastAuditAt: now,
+  });
+
+  await prisma.benefitLedger.upsert({
+    where: { entitlementId: entitlement.id },
+    create: {
+      entitlementId: entitlement.id,
+      expectedAmountPaise: expectedPerInstalment ?? 0n,
+      disbursedAmountPaise: ledger.disbursedAmount,
+      receivedAmountPaise: ledger.receivedAmount,
+      unverifiedAmountPaise: ledger.unverifiedAmount,
+      gapAmountPaise: ledger.gapAmount,
+      receiptState: ledger.receiptState,
+      recoveryStatus: ledger.recoveryStatus,
+      appliedAt: ledger.appliedAt,
+      lastAuditAt: now,
+    },
+    update: {
+      expectedAmountPaise: expectedPerInstalment ?? 0n,
+      disbursedAmountPaise: ledger.disbursedAmount,
+      receivedAmountPaise: ledger.receivedAmount,
+      unverifiedAmountPaise: ledger.unverifiedAmount,
+      gapAmountPaise: ledger.gapAmount,
+      receiptState: ledger.receiptState,
+      recoveryStatus: ledger.recoveryStatus,
+      lastAuditAt: now,
+    },
+  });
+
+  // -------------------------------------------------------------------------
+  // Lifecycle
+  // -------------------------------------------------------------------------
+  const target =
+    detection.decision === "ACTION_REQUIRED" && detection.gaps.length > 0
+      ? "GAP_DETECTED"
+      : reconciliations.length > 0
+        ? stateForReceipt(ledger.receiptState)
+        : applicationStatus === "APPROVED"
+          ? "APPROVED"
+          : null;
+
+  const recoveryOwnsIt = RECOVERY_IN_PROGRESS_STATES.includes(
+    entitlement.lifecycleState,
+  );
+
+  if (target && (input.manageLifecycle ?? true) && recoveryOwnsIt) {
+    // The recovery loop owns this benefit right now. The audit's facts are
+    // recorded above; moving the state would pull the case away from a plan
+    // awaiting the citizen's approval or an action being checked.
+    log.info("audit.lifecycle_deferred_to_recovery", {
+      entitlementId: entitlement.id,
+      state: entitlement.lifecycleState,
+    });
+  } else if (target && (input.manageLifecycle ?? true)) {
+    // An audit routinely learns several things at once: that the application
+    // was approved, that a payment was then released, and that nobody has
+    // confirmed receipt. Walking the path records each of those rather than
+    // jumping to the last one, so the trail shows a benefit that was approved
+    // and disbursed instead of one that teleported into "unverified".
+    const path = pathTo(entitlement.lifecycleState, target, {
+      // An audit observes; it never records a consent or an action. Routing
+      // through those states would write a trail entry claiming the citizen
+      // approved something, or that an action ran, when neither happened.
+      avoid: [...EXCEPTION_STATES, ...CONSENT_AND_ACTION_STATES],
+    });
+
+    if (path.length === 0 && entitlement.lifecycleState !== target) {
+      // Genuinely unreachable: the audit reached a conclusion the workflow
+      // cannot express from where this benefit sits. A real inconsistency, so
+      // it is logged loudly - but it must not discard the audit just computed.
+      log.warn("audit.unreachable_state", {
+        entitlementId: entitlement.id,
+        from: entitlement.lifecycleState,
+        to: target,
+      });
+    }
+
+    let current = entitlement.lifecycleState;
+    for (const step of path) {
+      await transitionEntitlement(prisma, {
+        entitlementId: entitlement.id,
+        citizenId: input.citizenId,
+        to: step,
+        actor,
+        // The final step carries the audit's summary; intermediate steps say
+        // what the audit established about them.
+        reason:
+          step === target
+            ? detection.summary
+            : `Established by audit: the benefit reached ${step.toLowerCase().replace(/_/g, " ")}.`,
+        evidenceRef: audit.id,
+        from: current,
+      });
+      current = step;
+    }
+  }
+
+  log.info("audit.completed", {
+    entitlementId: entitlement.id,
+    schemeCode: entitlement.scheme.code,
+    decision: detection.decision,
+    gaps: detection.gaps.length,
+    isMockData: gateway.isMock,
+  });
+
+  return {
+    auditId: audit.id,
+    entitlementId: entitlement.id,
+    schemeCode: entitlement.scheme.code,
+    decision: detection.decision,
+    summary: detection.summary,
+    gaps: detection.gaps,
+    provenMissingAmount,
+    unverifiedAmount,
+    receivedAmount,
+    findings,
+    isMockData: gateway.isMock,
+  };
+}
+
+/** Current period label for a benefit, used when recording a payment. */
+export function currentPeriod(
+  frequency: Parameters<typeof periodLabel>[0],
+  clock: Clock,
+): string {
+  return periodLabel(frequency, clock.now());
+}
