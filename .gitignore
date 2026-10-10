@@ -46,7 +46,7 @@ next-env.d.ts
 # documents required configuration. Keep it tracked.
 !.env.example
 
-# Vendored agent-skill copies written by `prisma init` for other editors.
+# Vendored agent-skill copies written by `prisma init` for editors.
 # Regenerable, and recorded in skills-lock.json.
 /.agents/
 /.windsurf/
