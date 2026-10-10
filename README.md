@@ -150,6 +150,8 @@ data is not touched.
 
 ## Architecture
 
+![AdhikarAI architecture](assets/architecture.png)
+
 ```
 app/              screens and API routes
 components/       UI; Money and StatusPill enforce product rules, not just styling
@@ -301,6 +303,8 @@ carries `isMock`, and the UI says so wherever those results appear.
 
 ## Documents
 
+- [`docs/OVERVIEW.md`](docs/OVERVIEW.md) — the project overview: the problem,
+  the benefit lifecycle, and the architecture diagram
 - [`docs/DEMO.md`](docs/DEMO.md) — a six-minute demo script, with the questions
   you will probably get and how to answer them
 - [`docs/DEPLOY.md`](docs/DEPLOY.md) — Vercel + Neon, the monitoring heartbeat,
