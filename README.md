@@ -303,6 +303,8 @@ carries `isMock`, and the UI says so wherever those results appear.
 
 ## Documents
 
+- [`assets/state-graphs/`](assets/state-graphs/) — LangGraph state graphs for every
+  agent flow, with PNG renders
 - [`docs/OVERVIEW.md`](docs/OVERVIEW.md) — the project overview: the problem,
   the benefit lifecycle, and the architecture diagram
 - [`docs/DEMO.md`](docs/DEMO.md) — a six-minute demo script, with the questions
